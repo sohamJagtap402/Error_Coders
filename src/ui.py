@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
-# -------------------------------
+# ------------------------------
 # PAGE CONFIG
-# -------------------------------
+# ------------------------------
 st.set_page_config(
     page_title="AP Shah Attendance System",
     page_icon="📝",
