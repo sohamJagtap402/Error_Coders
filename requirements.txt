@@ -1,0 +1,9 @@
+streamlit
+opencv-python
+pandas
+openpyxl
+numpy==1.26.4
+pdf2image
+scikit-image
+easyocr
+XlsxWriter
