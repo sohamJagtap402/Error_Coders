@@ -1,154 +1,119 @@
-import cv2
-import numpy as np
 import pandas as pd
-import re
 from datetime import datetime
-from src.image_processor import get_image_from_upload, preprocess_for_ocr
-from skimage.metrics import structural_similarity as ssim
-import easyocr
+import fitz  # PyMuPDF
+import os
+import json
+from PIL import Image
+import io
+import google.generativeai as genai
 
-# Initialize the EasyOCR reader. This is done once and the models are loaded into memory.
-reader = easyocr.Reader(['en'])
+# --- HELPER FUNCTIONS ---
 
-def get_signature_cells(row_image, num_cols):
-    """Safely splits a student's row image into individual cells for each date."""
-    cells = []
-    h, w = row_image.shape[:2]
-    if w == 0 or h == 0 or num_cols == 0: return []
-    col_width = w // num_cols
-    for j in range(num_cols):
-        cells.append(row_image[:, j*col_width:(j+1)*col_width])
-    return cells
+def get_image_from_file(file_path):
+    """Loads a high-quality image from a PDF or image file."""
+    if str(file_path).lower().endswith('.pdf'):
+        doc = fitz.open(str(file_path))
+        page = doc.load_page(0) # Process the first page
+        pix = page.get_pixmap(dpi=300)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        doc.close()
+        return img
+    else:
+        return Image.open(file_path)
 
-def detect_cancelled_columns(header_image, num_cols):
-    """Detects attendance columns that have been crossed out."""
-    cancelled = [False] * num_cols
-    h, w = header_image.shape[:2]
-    if w == 0 or h == 0 or num_cols == 0: return cancelled
-    col_width = w // num_cols
-    for i in range(num_cols):
-        col_crop = header_image[:, i*col_width:(i+1)*col_width]
-        gray = cv2.cvtColor(col_crop, cv2.COLOR_BGR2GRAY)
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
-        lines = cv2.HoughLinesP(binary, 1, np.pi/180, threshold=20, minLineLength=col_width*0.6, maxLineGap=10)
-        if lines is not None:
-            cancelled[i] = True
-    return cancelled
+# --- THE CORE GEMINI VISION LOGIC ---
 
-def analyze_row_consistency(signature_cells):
+def generate_final_report_with_gemini(api_key, file_path, output_folder, subject_name):
     """
-    Analyzes signatures in a single row to determine attendance status.
-    Returns: 'P' (Present), 'AB' (Absent), or 'INV' (Invalid Signature).
+    The main pipeline that uses Gemini Vision to analyze the attendance sheet.
     """
-    SIMILARITY_THRESHOLD = 0.45
+    # Configure the Gemini API
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-pro-vision')
 
-    present_cells = []
-    for idx, cell in enumerate(signature_cells):
-        if cell is None or cell.size == 0: continue
-        gray_cell = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-        density = np.count_nonzero(cv2.adaptiveThreshold(gray_cell, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                        cv2.THRESH_BINARY_INV, 11, 3)) / gray_cell.size
-        if density > 0.008:
-            present_cells.append({'idx': idx, 'img': gray_cell})
+    # Load the attendance sheet as an image
+    full_image = get_image_from_file(file_path)
 
-    if not present_cells:
-        return ["AB"] * len(signature_cells)
+    # --- 1. Holistic Information Extraction with Gemini ---
+    # This prompt asks Gemini to read the entire sheet and extract the key information.
+    prompt_for_structure = """
+    Analyze this image of a student attendance sheet from A.P. Shah Institute of Technology.
+    Your task is to extract the following information in a clean JSON format:
+    1.  A list of all students, where each student is an object with "moodle_id" and "name".
+    2.  A list of the handwritten dates from the attendance column headers. If a date is unreadable, represent it as "Unknown".
+    3.  The bounding box coordinates [x_min, y_min, x_max, y_max] for the main attendance grid where the signatures are marked.
 
-    reference_signature = cv2.resize(present_cells[0]['img'], (100, 50))
-    cell_statuses = {cell['idx']: "INV" for cell in present_cells}
-    cell_statuses[present_cells[0]['idx']] = "P"
+    Do not include any students who do not have a Moodle ID.
+    The final output should be a single JSON object.
+    """
 
-    for i in range(1, len(present_cells)):
-        current_signature = cv2.resize(present_cells[i]['img'], (100, 50))
-        score, _ = ssim(reference_signature, current_signature, full=True)
-        if score > SIMILARITY_THRESHOLD:
-            cell_statuses[present_cells[i]['idx']] = "P"
+    print("Asking Gemini to understand the document structure...")
+    response = model.generate_content([prompt_for_structure, full_image])
+    
+    # Clean and parse the JSON response from Gemini
+    json_response_text = response.text.strip().replace('```json', '').replace('```', '')
+    structure_data = json.loads(json_response_text)
+    
+    students = structure_data.get("students", [])
+    dates = structure_data.get("dates", [])
+    grid_bbox = structure_data.get("grid_bbox")
+
+    if not students or not dates or not grid_bbox:
+        raise ValueError("Gemini could not extract the required structure. The image may be unclear or in an unexpected format.")
+
+    # --- 2. Advanced Cell-by-Cell Analysis with Gemini ---
+    attendance_grid_crop = full_image.crop(grid_bbox)
+    num_students = len(students)
+    num_dates = len(dates)
+    row_height = attendance_grid_crop.height / num_students
+    col_width = attendance_grid_crop.width / num_dates
+
+    # This is the prompt for analyzing each individual attendance cell
+    prompt_for_cell = """
+    Analyze this single attendance cell based on these rules, in strict order of priority:
+    1.  If you see a red 'AB' or a red strikethrough line, the status is 'Absent'.
+    2.  If rule 1 does not apply, look for any handwritten signature (in blue, black, etc.). If a signature is present, the status is 'Present', even if it's on top of other text.
+    3.  If neither of the above is true, the status is 'Absent'.
+
+    Respond with only a single word: 'Present' or 'Absent'.
+    """
+
+    all_attendance_records = []
+    for i, student in enumerate(students):
+        print(f"Analyzing row for {student['name']}...")
+        student_record = {"Moodle ID": student["moodle_id"], "Name": student["name"]}
+        row_y1 = i * row_height
+        row_y2 = (i + 1) * row_height
+
+        for j, date in enumerate(dates):
+            col_x1 = j * col_width
+            col_x2 = (j + 1) * col_width
             
-    final_statuses = ["AB"] * len(signature_cells)
-    for idx, status in cell_statuses.items():
-        final_statuses[idx] = status
+            # Crop the specific cell for one student on one date
+            cell_bbox = (col_x1, row_y1, col_x2, row_y2)
+            cell_image = attendance_grid_crop.crop(cell_bbox)
+            
+            # Ask Gemini to analyze the cell
+            response = model.generate_content([prompt_for_cell, cell_image])
+            status = response.text.strip()
+            
+            column_name = date if date != "Unknown" else f"Date_{j+1}"
+            student_record[column_name] = "P" if "Present" in status else "AB"
         
-    return final_statuses
+        all_attendance_records.append(student_record)
 
-def generate_final_report(file_path, output_folder):
-    """The main pipeline to generate the final, styled attendance report."""
-    original_image = get_image_from_upload(file_path)
-
-    gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
-    binary_inv = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-    contours, _ = cv2.findContours(binary_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    table_contour = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(table_contour)
-
-    student_info_x2 = x + int(w * 0.40)
-    student_info_crop = original_image[y:y+h, x:student_info_x2]
-    processed_student_info = preprocess_for_ocr(student_info_crop)
-    
-    student_records = []
-    if processed_student_info is not None:
-        student_results = reader.readtext(processed_student_info, paragraph=False)
-        for i, (_, text, _) in enumerate(student_results):
-            if text.strip().isdigit() and len(text.strip()) >= 8:
-                name = ""
-                if i + 1 < len(student_results):
-                    name_candidate = student_results[i+1][1]
-                    if not name_candidate.strip().isdigit():
-                        name = name_candidate
-                student_records.append({"Moodle ID": text.strip(), "Name": name.strip()})
-
-    grid_x1 = student_info_x2
-    dates_header_crop = original_image[max(0, y-100):y, grid_x1:x+w]
-    num_date_cols = 7
-    cancelled_cols = detect_cancelled_columns(dates_header_crop, num_date_cols)
-    
-    processed_dates_header = preprocess_for_ocr(dates_header_crop)
-    extracted_dates = []
-    if processed_dates_header is not None:
-        date_results = reader.readtext(processed_dates_header, detail=0)
-        extracted_dates = [re.sub(r'[^0-9/]', '', d) for d in date_results if re.search(r'\d', d)]
-    while len(extracted_dates) < num_date_cols:
-        extracted_dates.append(f"Date_{len(extracted_dates)+1}")
-
-    if student_records:
-        attendance_grid_crop = original_image[y:y+h, grid_x1:x+w]
-        row_height = attendance_grid_crop.shape[0] / len(student_records)
-        for i, record in enumerate(student_records):
-            row_y1, row_y2 = int(i * row_height), int((i + 1) * row_height)
-            student_row_crop = attendance_grid_crop[row_y1:row_y2, :]
-            
-            signature_cells = get_signature_cells(student_row_crop, num_date_cols)
-            statuses = analyze_row_consistency(signature_cells)
-            
-            for j, date in enumerate(extracted_dates):
-                column_name = date if date else f"Date_{j+1}"
-                record[column_name] = "AB" if cancelled_cols[j] else statuses[j]
-
-    df = pd.DataFrame(student_records)
+    # --- 3. Final Report Generation ---
+    df = pd.DataFrame(all_attendance_records)
     date_cols = [col for col in df.columns if col not in ["Moodle ID", "Name"]]
     
     df['Attended'] = df[date_cols].apply(lambda row: (row == 'P').sum(), axis=1)
     df['Total'] = len(date_cols)
     df['Percentage'] = (df['Attended'] / df['Total'] * 100).round(2)
-
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"{output_folder}/Final_Attendance_Report_{timestamp}.xlsx"
+    filename = f"Gemini_Report_{subject_name.replace(' ', '_')}_{timestamp}.xlsx"
+    output_path = os.path.join(output_folder, filename)
 
-    writer = pd.ExcelWriter(output_path, engine='xlsxwriter')
-    df.to_excel(writer, sheet_name='Attendance Report', index=False)
+    df.to_excel(output_path, sheet_name='Attendance Report', index=False)
     
-    workbook = writer.book
-    worksheet = writer.sheets['Attendance Report']
-    
-    formats = {
-        'P': workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'}),
-        'AB': workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}),
-        'INV': workbook.add_format({'bg_color': '#FFEB9C', 'font_color': '#9C6500'})
-    }
-    
-    for status, fmt in formats.items():
-        worksheet.conditional_format(1, 2, len(df)+1, len(date_cols)+1, 
-                                     {'type': 'cell', 'criteria': '==', 'value': f'"{status}"', 'format': fmt})
-    
-    writer.close()
     return output_path
